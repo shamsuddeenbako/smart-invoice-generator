@@ -6,31 +6,53 @@ import json
 import re
 import datetime
 import os
+import pandas as pd  # <--- NEW LIBRARY FOR DATA
 
-# 1. SETUP THE PAGE
-st.set_page_config(page_title="Smart Invoice Generator", page_icon="🧾", layout="wide")
+# 1. SETUP PAGE
+st.set_page_config(page_title="Alh Jibrin Store AI", page_icon="🛒", layout="wide")
 
-# 2. SIDEBAR FOR SETTINGS
+# 2. SIDEBAR
 with st.sidebar:
-    st.image("https://cdn-icons-png.flaticon.com/512/2534/2534204.png", width=100)
-    st.title("Settings")
-    
-    # Securely ask for API Key here so you don't hardcode it
-    api_key = st.text_input("Enter Google API Key", type="password")
+    st.title("⚙️ Settings")
+    api_key = st.text_input("Google API Key", type="password")
+    if api_key:
+        os.environ["GOOGLE_API_KEY"] = api_key
+        genai.configure(api_key=api_key)
     
     st.divider()
-    st.write("📦 **Product Database (Simulation)**")
-    # This simulates your shop's database
-    product_database = {
-        "sugar": 1500, "maggi": 1200, "indomie": 11500,
-        "cowbell": 850, "macaroni": 1100, "semovita": 9500,
-        "milk": 500, "rice": 2000
-    }
-    st.write(product_database)
+    st.write("📦 **Inventory Status**")
+    
+    # --- LOAD THE CSV DATABASE ---
+    try:
+        # Load the CSV file
+        df = pd.read_csv("products.csv")
+        
+        # Clean the data: Convert Item names to lowercase for matching
+        df['Item Description'] = df['Item Description'].astype(str).str.lower().str.strip()
+        
+        # Clean the price: Remove commas if they exist (e.g., "1,500" -> 1500)
+        # Check if column is string before replacing
+        if df['Sale Price'].dtype == 'O': 
+            df['Sale Price'] = df['Sale Price'].astype(str).str.replace(',', '').astype(float)
+            
+        # Create a dictionary for fast lookup: {'sugar': 1500, ...}
+        product_db = dict(zip(df['Item Description'], df['Sale Price']))
+        
+        st.success(f"✅ Loaded {len(product_db)} items from database.")
+        
+        # Optional: Show a few items
+        with st.expander("View Price List"):
+            st.dataframe(df[['Item Description', 'Sale Price']])
+            
+    except FileNotFoundError:
+        st.error("⚠️ 'products.csv' not found. Please upload it.")
+        product_db = {} # Empty fallback
+    except Exception as e:
+        st.error(f"Error loading database: {e}")
+        product_db = {}
 
 # 3. HELPER FUNCTIONS
 def get_model():
-    """Finds the best available model (Flash preferred)."""
     try:
         models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
         flash = [m for m in models if 'flash' in m.lower()]
@@ -39,12 +61,10 @@ def get_model():
         return None
 
 def generate_receipt_image(scanned_list, grand_total):
-    """Draws the receipt image."""
     width, height = 500, 350 + (len(scanned_list) * 50)
     img = Image.new("RGB", (width, height), "white")
     draw = ImageDraw.Draw(img)
     
-    # Fonts
     try:
         font_header = ImageFont.truetype("arial.ttf", 40)
         font_body = ImageFont.truetype("arial.ttf", 24)
@@ -54,11 +74,9 @@ def generate_receipt_image(scanned_list, grand_total):
         font_body = ImageFont.load_default()
         font_bold = ImageFont.load_default()
 
-    # Draw Content
     draw.text((width//2, 30), "ALH JIBRIN STORE", fill="black", font=font_header, anchor="mm")
-    draw.text((width//2, 80), "Dukku, Gombe State", fill="black", font=font_body, anchor="mm")
+    draw.text((width//2, 80), "Provision Store, Dukku", fill="black", font=font_body, anchor="mm")
     draw.text((width//2, 120), datetime.datetime.now().strftime("%Y-%m-%d %H:%M"), fill="black", font=font_body, anchor="mm")
-    
     draw.line([(20, 150), (width-20, 150)], fill="black", width=2)
     
     y = 170
@@ -85,91 +103,90 @@ def generate_receipt_image(scanned_list, grand_total):
 
     return img
 
-# 4. MAIN USER INTERFACE
-st.title("🧾 Smart Invoice Generator")
-st.write("Upload a photo of a handwritten list to generate an invoice instantly.")
+# 4. MAIN UI
+st.title("🛒 Smart Invoice Generator")
+st.markdown("Automatic Price Lookup enabled for **Alh Jibrin Bako Provision Store**")
 
-uploaded_file = st.file_uploader("Upload Image (JPG/PNG)", type=["jpg", "jpeg", "png"])
+uploaded_file = st.file_uploader("Upload Handwritten List", type=["jpg", "jpeg", "png"])
 
-if uploaded_file and st.button("🚀 Process Invoice"):
+if uploaded_file and st.button("Process Invoice"):
     if not api_key:
-        st.error("❌ Please enter your Google API Key in the sidebar first.")
-    else:
-        # Configure Key
+        st.error("Please enter API Key.")
+        st.stop()
+    
+    # Check if DB is loaded
+    if not product_db:
+        st.warning("⚠️ Database not loaded. Prices will be 0 unless written on paper.")
+
+    with st.spinner('🤖 Reading list & Looking up prices...'):
         os.environ["GOOGLE_API_KEY"] = api_key
         genai.configure(api_key=api_key)
         
-        with st.spinner('🤖 AI is reading your handwriting...'):
-            image = Image.open(uploaded_file)
+        image = Image.open(uploaded_file)
+        model_name = get_model()
+        model = genai.GenerativeModel(model_name)
+        
+        prompt = """
+        Analyze this handwritten list for a Nigerian provision store.
+        1. Identify Quantity, Item Name (e.g. 'Indomie', 'Peak Milk').
+        2. Ignore prices written on paper if they are messy; we will use the database.
+        3. Correct spelling (e.g. 'Semov' -> 'Semovita', 'Spag' -> 'Spaghetti').
+        4. Return ONLY JSON: [{"qty": 1, "item": "Item Name"}]
+        """
+        
+        try:
+            response = model.generate_content([prompt, image])
+            match = re.search(r'\[.*\]', response.text, re.DOTALL)
+            raw_data = json.loads(match.group(0)) if match else []
             
-            # Call AI
-            model_name = get_model()
-            if not model_name:
-                st.error("Could not find any Gemini models.")
-                st.stop()
+            final_total = 0
+            clean_list = []
+            
+            # --- THE INTELLIGENT MATCHING LOGIC ---
+            for row in raw_data:
+                # Get the detected name (e.g., "Indomie")
+                ai_item_name = row.get('item', '').lower().strip()
+                qty = row.get('qty', 1)
                 
-            model = genai.GenerativeModel(model_name)
-            prompt = """
-            Analyze this handwritten list.
-            1. Identify Quantity, Item Name, and Unit Price.
-            2. Correct spelling contextually for Nigerian retail (e.g. 'Semov' -> 'Semovita').
-            3. Return ONLY valid JSON list: [{"qty": 1, "item": "Milk", "unit_price": 500}]
-            """
-            
-            try:
-                response = model.generate_content([prompt, image])
-                match = re.search(r'\[.*\]', response.text, re.DOTALL)
-                if match:
-                    raw_data = json.loads(match.group(0))
-                else:
-                    raw_data = []
-                    st.warning("AI saw the image but couldn't find a list. Try writing clearer.")
-
-                # Calculate Totals
-                final_total = 0
-                clean_list = []
-                for row in raw_data:
-                    item_name = row.get('item', '').lower()
-                    qty = row.get('qty', 1)
-                    price = 0
-                    
-                    # Database Logic
-                    for db_item, db_price in product_database.items():
-                        if db_item in item_name:
+                # LOOKUP PRICE
+                # 1. Exact Match
+                price = product_db.get(ai_item_name, 0)
+                
+                # 2. Fuzzy Match (If exact fails)
+                # Example: AI sees "Indomie", DB has "Indomie Supreme".
+                if price == 0:
+                    for db_name, db_price in product_db.items():
+                        # Check if one string is inside the other
+                        if ai_item_name in db_name or db_name in ai_item_name:
                             price = db_price
+                            # Update name to the official DB name
+                            row['item'] = db_name.title() 
                             break
-                    if price == 0 and row.get('unit_price'):
-                        price = row.get('unit_price')
-                        
-                    line_total = qty * price
-                    final_total += line_total
-                    clean_list.append({"qty": qty, "item": row.get('item'), "line_total": line_total})
-
-                # Display Results
-                st.success("✅ Done!")
-                col1, col2 = st.columns(2)
                 
-                with col1:
-                    st.subheader("📝 Detected Items")
-                    st.table(clean_list)
-                    st.info(f"Grand Total: N{final_total:,}")
+                line_total = qty * price
+                final_total += line_total
                 
-                with col2:
-                    st.subheader("🖼️ Digital Receipt")
-                    receipt_img = generate_receipt_image(clean_list, final_total)
-                    st.image(receipt_img, caption="Ready to Print", width=350)
-                    
-                    # Download Button
-                    buf = io.BytesIO()
-                    receipt_img.save(buf, format="JPEG")
-                    byte_im = buf.getvalue()
-                    
-                    st.download_button(
-                        label="📥 Download Receipt Image",
-                        data=byte_im,
-                        file_name="receipt.jpg",
-                        mime="image/jpeg"
-                    )
-
-            except Exception as e:
-                st.error(f"Error: {e}")
+                clean_list.append({
+                    "qty": qty, 
+                    "item": row.get('item').title(), 
+                    "line_total": line_total
+                })
+            
+            # Display
+            col1, col2 = st.columns(2)
+            with col1:
+                st.subheader("Detected Items")
+                st.table(clean_list)
+                st.metric("Grand Total", f"N{final_total:,}")
+            
+            with col2:
+                st.subheader("Receipt Preview")
+                receipt_img = generate_receipt_image(clean_list, final_total)
+                st.image(receipt_img, width=350)
+                
+                buf = io.BytesIO()
+                receipt_img.save(buf, format="JPEG")
+                st.download_button("Download Receipt", buf.getvalue(), "receipt.jpg", "image/jpeg")
+                
+        except Exception as e:
+            st.error(f"Error: {e}")
